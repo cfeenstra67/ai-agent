@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "ai-agent"
+version = "0.1.0"
+description = ""
+authors = ["cfeenstra67 <cameron.l.feenstra@gmail.com>"]
+readme = "README.md"
+packages = [{include = "ai_agent"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pluggy = "^1.0.0"
+sqlalchemy = "^2.0.13"
+aiosqlite = "^0.19.0"
+greenlet = "^2.0.2"
+blinker = "^1.6.2"
+
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.3.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

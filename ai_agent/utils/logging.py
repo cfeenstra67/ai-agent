@@ -28,7 +28,7 @@ def setup_logging(
         },
         "loggers": {
             "": {"handlers": ["default"], "level": "ERROR", "propagate": False},
-            "ai_agent": {"handlers": ["default"], "level": "INFO", "propagate": False},
+            "ai_agent": {"handlers": ["default"], "level": level, "propagate": False},
         },
     }
 
