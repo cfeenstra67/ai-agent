@@ -1,8 +1,10 @@
+import shlex
 import textwrap
 import re
 from typing import Iterator, List
 
-from ai_agent.agent import CommandParser, CommandRequest, MessageProvider, AgentMessage, Context, AIAgentError
+from ai_agent.agent import CommandParser, CommandRequest, Context, AIAgentError
+from ai_agent.modular_agent import MessageProvider, AgentMessage
 
 
 class DefaultCommandParser(CommandParser, MessageProvider):
@@ -20,7 +22,7 @@ class DefaultCommandParser(CommandParser, MessageProvider):
     EOF
     """).strip()
 
-    async def get_messages(self, agent: str, ctx: Context) -> List[AgentMessage]:
+    async def get_messages(self, ctx: Context) -> List[AgentMessage]:
         return [AgentMessage(self.docs)]
 
     def parse(self, result: str) -> Iterator[CommandRequest]:
@@ -30,7 +32,14 @@ class DefaultCommandParser(CommandParser, MessageProvider):
             line, *other_parts = rest.split("\n", 1)
             if other_parts:
                 rest = other_parts[0].lstrip("\r")
+            else:
+                rest = ""
             
+            if not line.startswith("$$"):
+                continue
+                
+            line = line[2:]
+
             line_match = re.search(r"^(.+)(<<[A-Z]+)\s*$", line)
             body = None
             if line_match:
@@ -44,7 +53,7 @@ class DefaultCommandParser(CommandParser, MessageProvider):
                 body = rest[:end - 1]
                 rest = rest[end + len(body_key) + 1:]
 
-            command, *args = line.strip().split()
+            command, *args = shlex.split(line)
             yield CommandRequest(command, args, body)
 
 

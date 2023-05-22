@@ -34,6 +34,7 @@ class EventModel(Base):
     type: Mapped[str]
     destination: Mapped[str]
     payload: Mapped[str]
+    priority: Mapped[int]
     queued_at: Mapped[datetime]
     run_at: Mapped[datetime]
     result: Mapped[Optional[str]]
@@ -42,4 +43,4 @@ class EventModel(Base):
     source_event_id: Mapped[Optional[int]] = mapped_column(
         sa.ForeignKey("event.event_id")
     )
-    source_event: Mapped[Optional["EventModel"]] = relationship()
+    source_event: Mapped[Optional["EventModel"]] = relationship(remote_side=[event_id])

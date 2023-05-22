@@ -1,46 +1,56 @@
 import abc
 import asyncio
-import bisect
 import contextlib
 import dataclasses as dc
 import logging
 import traceback
 from datetime import datetime
-from typing import List, Iterator, Optional, Dict, Tuple, Any, Callable
+from typing import List, Iterator, Optional, Dict, Any, Callable, Union, Awaitable
 
-from sqlalchemy.ext.asyncio import AsyncEngine
+from aiohttp import web
+from blinker import signal
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
-from ai_agent.event_bus import EventBus, QueuedEvent, Event, event_queued
+from ai_agent.event_bus import EventBus, QueuedEvent, Event, event_queued, event_bus_aiohttp_app, DEFAULT_PRIORITY
+from ai_agent.utils.blinker import iterate_signals
+from ai_agent.utils.aiohttp import aiohttp_error_handler_middleware
+from ai_agent.utils.asyncio import maybe_await
 
 
 LOGGER = logging.getLogger(__name__)
 
+task_queue_empty = signal("task-queue-empty")
+
 
 class Context:
     """ """
+    event_id: Optional[int]
 
     def __init__(
         self,
+        session_id: int,
         engine: AsyncEngine,
         event_bus: EventBus,
         commands: List["Command"],
         get_event_future: Callable[[int], asyncio.Future],
-        queue_kwargs: Optional[Dict[str, Any]] = None,
+        event: Optional[QueuedEvent] = None,
     ) -> None:
+        self.session_id = session_id
         self.engine = engine
-        self.event_bus = event_bus
-        self.queue_kwargs = queue_kwargs or {}
-        self.get_event_future = get_event_future
         self.commands = commands
-
-    def get_commands(self) -> List["Command"]:
-        return self.commands
+        self.event = event
+        self.event_id = event and event.event_id
+        self._event_bus = event_bus
+        self._get_event_future = get_event_future
+        self.Session = async_sessionmaker(bind=engine)
 
     async def queue_agent(
-        self, agent: str, message: str, run_at: Optional[datetime] = None
+        self, agent: str, message: str, *, run_at: Optional[datetime] = None, priority: int = DEFAULT_PRIORITY
     ) -> QueuedEvent:
-        return await self.event_bus.queue_event(
-            Event("agent", agent, {"message": message}), run_at=run_at, **self.queue_kwargs
+        return await self._event_bus.queue_event(
+            Event("agent", agent, {"message": message}, priority),
+            run_at=run_at,
+            source_event=self.event
         )
 
     async def queue_command(
@@ -48,20 +58,42 @@ class Context:
         command: str,
         args: List[str],
         body: Optional[str] = None,
+        *,
         run_at: Optional[datetime] = None,
+        priority: int = DEFAULT_PRIORITY,
     ) -> QueuedEvent:
-        return await self.event_bus.queue_event(
-            Event("command", command, {"args": args, "body": body}),
+        return await self._event_bus.queue_event(
+            Event("command", command, {"args": args, "body": body}, priority),
             run_at=run_at,
-            **self.queue_kwargs,
+            source_event=self.event,
         )
 
-    async def wait_for_event(self, event_id: int) -> Optional[str]:
-        event = await self.event_bus.get_event(event_id)
-        if event.acknowledged:
-            return event.result
-        future = self.get_event_future(event_id)
+    async def get_event_history(
+        self,
+        type: str,
+        destination: str,
+        limit: int,
+    ) -> List[QueuedEvent]:
+        return await self._event_bus.get_event_history(
+            type,
+            destination,
+            limit,
+        )
+
+    async def wait_for_event(self, event: Union[QueuedEvent, int]) -> Optional[str]:
+        if isinstance(event, QueuedEvent):
+            event = event.event_id
+
+        event_obj = await self._event_bus.get_event(event)
+        if event_obj.acknowledged:
+            return event_obj.result
+        future = self._get_event_future(event)
         return await future
+
+    @contextlib.asynccontextmanager
+    async def session_ctx(self):
+        async with self.Session() as session:
+            yield session
 
 
 @dc.dataclass(frozen=True)
@@ -90,33 +122,15 @@ class Command(abc.ABC):
         """ """
         return CommandDocumentation(self.name, self.name)
 
-    def validate(self, args: List[str], body: Optional[str] = None) -> None:
-        """ """
+    def validate(self, args: List[str], body: Optional[str] = None) -> Optional[int]:
+        """
+        Validate the message. Optionally return a priority
+        """
 
     @abc.abstractmethod
     async def __call__(self, cmd: CommandRequest, ctx: Context) -> Optional[str]:
         """ """
         raise NotImplementedError
-
-
-# @dc.dataclass(frozen=True)
-# class AgentMessage:
-#     """ """
-
-#     message: str
-#     actor: str = "user"
-#     level: str = "INFO"
-
-
-# class MessageProvider(abc.ABC):
-#     """ """
-
-#     name: str
-
-#     @abc.abstractmethod
-#     async def get_messages(self, agent: str, ctx: Context) -> List[AgentMessage]:
-#         """ """
-#         raise NotImplementedError
 
 
 class CommandParser(abc.ABC):
@@ -133,26 +147,38 @@ class Agent(abc.ABC):
 
     name: str
 
+    def aiohttp_app(self) -> Optional[web.Application]:
+        """
+        """
+        return None
+
     @abc.abstractmethod
-    def format_command_result(self, event: QueuedEvent, result: str) -> str:
+    async def format_command_result(self, event: QueuedEvent, result: str) -> str:
         """ """
         raise NotImplementedError
 
     @abc.abstractmethod
-    def format_command_error(
+    async def format_command_error(
         self, event: QueuedEvent, error: Exception, stack: str
     ) -> str:
         """ """
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def chat(
-        self,
-        payload: AgentMessage,
-        messages: List[AgentMessage] = (),
-    ) -> str:
+    async def chat(self, message: str, ctx: Context) -> str:
         """ """
         raise NotImplementedError
+
+
+EventPrioritizer = Callable[
+    [List[QueuedEvent]],
+    Union[List[QueuedEvent], Awaitable[List[QueuedEvent]]]
+]
+
+AgentMiddleware = Callable[
+    [Agent, Context],
+    Union[Agent, Awaitable[Agent]]
+]
 
 
 class Runner:
@@ -160,27 +186,51 @@ class Runner:
 
     def __init__(
         self,
-        command_parser: CommandParser,
-        event_bus: EventBus,
+        session_id: int,
         engine: AsyncEngine,
         agents: List[Agent] = (),
+        agent_middlewares: List[AgentMiddleware] = (),
         commands: List[Command] = (),
-        # message_providers: List[MessageProvider] = (),
+        command_parser: Optional[CommandParser] = None,
+        event_bus: Optional[EventBus] = None,
+        prioritizer: Optional[EventPrioritizer] = None,
+        aiohttp_app: Optional[web.Application] = None,
     ) -> None:
         """ """
+        if event_bus is None:
+            event_bus = EventBus(engine, session_id)
+
+        if command_parser is None:
+            from ai_agent.default_command_parser import DefaultCommandParser
+            command_parser = DefaultCommandParser()
+        
+        if aiohttp_app is None:
+            aiohttp_app = web.Application(
+                middlewares=[aiohttp_error_handler_middleware]
+            )
+        
+        if prioritizer is None:
+            from ai_agent.prioritizers import default_prioritizer
+            prioritizer = default_prioritizer
+
+        self.session_id = session_id
+        self.engine = engine
+        self.agent_middlewares = agent_middlewares
         self.command_parser = command_parser
         self.event_bus = event_bus
-        self.engine = engine
+        self.prioritizer = prioritizer
+        self.aiohttp_app = aiohttp_app
+        
+        self.aiohttp_app.add_subapp(
+            "/event-bus",
+            event_bus_aiohttp_app(event_bus)
+        )
 
         self.commands: Dict[str, Command] = {}
         self.agents: Dict[str, Agent] = {}
-        self.message_providers: List[Tuple[MessageProvider, int]] = []
 
         for command in commands:
             self.register_command(command)
-
-        # for idx, message_provider in enumerate(message_providers):
-        #     self.register_message_provider(message_provider, order=idx)
 
         for agent in agents:
             self.register_agent(agent)
@@ -188,6 +238,9 @@ class Runner:
         self._event_futures: Dict[int, List[asyncio.Future]] = {}
 
     def register_command(self, command: Command) -> None:
+        from ai_agent.api import get_command
+
+        command = get_command(command)
         if command.name in self.commands:
             raise ValueError(f"'{command.name}' already registered")
         self.commands[command.name] = command
@@ -196,15 +249,12 @@ class Runner:
         if agent.name in self.agents:
             raise ValueError(f"'{agent.name}' already registered")
         self.agents[agent.name] = agent
+        
+        app = agent.aiohttp_app()
+        if app is not None:
+            self.aiohttp_app.add_subapp(f"/agents/{agent.name}", app)
 
-    # def register_message_provider(
-    #     self, message_provider: MessageProvider, order: float = float("inf")
-    # ) -> None:
-    #     bisect.insort(
-    #         self.message_providers, (message_provider, order), key=lambda x: x[1]
-    #     )
-    
-    def context(self, **kwargs) -> Context:
+    def context(self, event: Optional[QueuedEvent] = None) -> Context:
 
         def get_future(event_id):
             future = asyncio.Future()
@@ -212,11 +262,12 @@ class Runner:
             return future
 
         return Context(
+            self.session_id,
             self.engine,
             self.event_bus,
             list(self.commands.values()),
             get_future,
-            queue_kwargs=kwargs
+            event=event
         )
 
     def _handle_event_result(self, event: QueuedEvent, result: str) -> None:
@@ -233,16 +284,12 @@ class Runner:
             raise InvalidAgent(agent_name)
         agent = self.agents[agent_name]
 
-        ctx = self.context(source_event=event)
-        messages = []
+        ctx = self.context(event)
 
-        for message_provider, _ in self.message_providers:
-            messages.extend(message_provider.get_messages(agent_name, ctx))
+        for middleware in self.agent_middlewares:
+            agent = await maybe_await(middleware(agent, ctx))
 
-        response = await agent.chat(
-            AgentMessage(**event.payload),
-            messages,
-        )
+        response = await agent.chat(event.payload["message"], ctx)
 
         try:
             commands = list(self.command_parser.parse(response))
@@ -250,19 +297,23 @@ class Runner:
             raise AgentResponseValidationError(response, "parsing", [err])
 
         errors = []
+        priorities = []
         for command in commands:
             try:
                 if command.command not in self.commands:
-                    raise InvalidCommand(command)
-                self.commands[command.command].validate(command.args, command.body)
+                    raise InvalidCommand(command.command)
+                priority = self.commands[command.command].validate(command.args, command.body)
+                if priority is None:
+                    priority = DEFAULT_PRIORITY
+                priorities.append(priority)
             except Exception as err:
                 errors.append(CommandValidationError(command, err))
 
         if errors:
             raise AgentResponseValidationError(response, "validation", errors)
 
-        for command in commands:
-            await ctx.queue_command(command.command, command.args, command.body)
+        for command, priority in zip(commands, priorities):
+            await ctx.queue_command(command.command, command.args, command.body, priority=priority)
 
         return response
 
@@ -272,7 +323,7 @@ class Runner:
             raise InvalidCommand(command_name)
         command = self.commands[command_name]
 
-        ctx = self.context(source_event=event)
+        ctx = self.context(event)
 
         response = await command(
             CommandRequest(
@@ -290,7 +341,7 @@ class Runner:
 
             agent = self.agents[agent_name]
             await ctx.queue_agent(
-                event.source_destination, agent.format_command_result(event, response)
+                event.source_destination, await agent.format_command_result(event, response)
             )
 
         return response
@@ -298,7 +349,7 @@ class Runner:
     async def _handle_agent_error(
         self, event: QueuedEvent, error: Exception, stack: str
     ) -> None:
-        ctx = self.context(source_event=event)
+        ctx = self.context(event)
 
         agent_name = event.destination
         if agent_name not in self.agents:
@@ -307,13 +358,14 @@ class Runner:
         agent = self.agents[agent_name]
 
         await ctx.queue_agent(
-            event.destination, agent.format_command_error(event, error, stack)
+            event.destination, await agent.format_command_error(event, error, stack),
+            priority=DEFAULT_PRIORITY + 1
         )
 
     async def _handle_command_error(
         self, event: QueuedEvent, error: Exception, stack: str
     ) -> None:
-        ctx = self.context(source_event=event)
+        ctx = self.context(event)
 
         if event.source_type == "agent":
             agent_name = event.source_destination
@@ -323,7 +375,8 @@ class Runner:
             agent = self.agents[agent_name]
 
             await ctx.queue_agent(
-                agent_name, agent.format_command_error(event, error, stack)
+                agent_name, await agent.format_command_error(event, error, stack),
+                priority=DEFAULT_PRIORITY + 1
             )
 
     async def _handle_error(
@@ -395,16 +448,17 @@ class Runner:
         reverse_tasks = {}
 
         async def wait(events: List[QueuedEvent]) -> None:
-            if not events:
-                return
-
             for event in events:
                 event_map[event.event_id] = event
                 if event.event_id in tasks:
                     continue
+
                 task = asyncio.create_task(self._handle_event(event))
                 tasks[event.event_id] = task
                 reverse_tasks[id(task)] = event.event_id
+            
+            if not tasks:
+                return True
 
             done, _ = await asyncio.shield(asyncio.wait(
                 list(tasks.values()), return_when=asyncio.FIRST_COMPLETED
@@ -413,6 +467,7 @@ class Runner:
                 event_id = reverse_tasks.pop(id(task))
                 tasks.pop(event_id, None)
                 event = event_map.pop(event_id)
+
                 try:
                     task.result()
                     LOGGER.debug("Event %d finished", event_id)
@@ -420,30 +475,21 @@ class Runner:
                     LOGGER.exception(
                         "Unexpected error when handling event %d", event_id
                     )
-        
+            
+            return False
+
         try:
             yield wait
         except asyncio.CancelledError:
             for task in tasks.values():
                 task.cancel()
+            raise
 
     async def _wait_for_events(self) -> None:
-        future = asyncio.Future()
+        async for _, kwargs in iterate_signals(event_queued, self.event_bus):
+            yield kwargs["event"]
 
-        @event_queued.connect_via(self.event_bus)
-        def handler(_, event):
-            nonlocal future
-            future.set_result(event)
-
-        try:
-            while True:
-                resolved = await future
-                future = asyncio.Future()
-                yield resolved
-        finally:
-            event_queued.disconnect(handler, self.event_bus)
-
-    async def run(self, poll_interval: float = 1.0) -> None:
+    async def run(self) -> None:
         events_gen = self._wait_for_events()
 
         wait_task = None
@@ -452,13 +498,11 @@ class Runner:
         with self._task_waiter() as wait:
             while True:
                 events = await self.event_bus.get_queued_events()
-                if not events:
-                    LOGGER.info(
-                        "No pending messages found, sleeping for %.2fs", poll_interval
-                    )
-                    await asyncio.sleep(poll_interval)
-                    continue
-                
+                if events:
+                    events = await maybe_await(self.prioritizer(events))
+                else:
+                    task_queue_empty.send(self)
+
                 if wait_task is not None:
                     wait_task.cancel()
 
@@ -469,10 +513,15 @@ class Runner:
                 
                 await asyncio.wait([wait_task, event_task], return_when=asyncio.FIRST_COMPLETED)
 
+                empty = False
                 if wait_task.done():
-                    wait_task.result()
+                    empty = wait_task.result()
                     wait_task = None
                 
+                if empty and not event_task.done():
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(asyncio.shield(event_task), 5)
+
                 if event_task.done():
                     event_task.result()
                     event_task = None

@@ -4,12 +4,15 @@ from datetime import datetime
 from typing import Any, Optional, List
 
 import sqlalchemy as sa
+from aiohttp import web
 from blinker import signal
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, AsyncSession
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload, selectinload
 
 from ai_agent.models import EventModel, SessionModel
 
+
+DEFAULT_PRIORITY = 0
 
 event_queued = signal("event-queued")
 
@@ -31,6 +34,7 @@ class Event:
     type: str
     destination: str
     payload: Any
+    priority: int = DEFAULT_PRIORITY
 
 
 @dc.dataclass(frozen=True)
@@ -43,6 +47,7 @@ class QueuedEvent:
     destination: str
     payload: Any
     acknowledged: bool
+    priority: int
     result: Optional[str] = None
     source_id: Optional[int] = None
     source_type: Optional[str] = None
@@ -59,6 +64,7 @@ async def model_to_queued_event(event: EventModel) -> QueuedEvent:
         payload=json.loads(event.payload),
         acknowledged=event.acknowledged_at is not None,
         result=event.result,
+        priority=event.priority,
         source_id=source_event and source_event.event_id,
         source_destination=source_event and source_event.destination,
         source_type=source_event and source_event.type,
@@ -70,7 +76,7 @@ class EventBus:
 
     def __init__(self, engine: AsyncEngine, session_id: int) -> None:
         self.engine = engine
-        self.Session = async_sessionmaker(bind=engine)
+        self.Session = async_sessionmaker(bind=engine, expire_on_commit=False)
         self.session_id = session_id
 
     async def _get_session(self, session: AsyncSession) -> SessionModel:
@@ -100,6 +106,7 @@ class EventBus:
             type=message.type,
             destination=message.destination,
             payload=json.dumps(message.payload),
+            priority=message.priority,
             queued_at=queued_at,
             run_at=run_at,
             source_event_id=source_event and source_event.event_id,
@@ -152,11 +159,36 @@ class EventBus:
                 .where(EventModel.session_id == self.session_id)
                 .where(EventModel.acknowledged_at == None)
                 .where(EventModel.run_at <= now)
+                .order_by(EventModel.queued_at)
             )
             out = []
             for event in results.scalars():
                 out.append(await model_to_queued_event(event))
 
+            return out
+
+    async def get_event_history(
+        self,
+        type: str,
+        destination: str,
+        limit: int,
+    ) -> List[QueuedEvent]:
+        async with self.Session() as session:
+            await self._get_session(session)
+            results = await session.execute(
+                sa.select(EventModel)
+                .options(joinedload(EventModel.source_event))
+                .where(EventModel.session_id == self.session_id)
+                .where(EventModel.acknowledged_at != None)
+                .where(EventModel.type == type)
+                .where(EventModel.destination == destination)
+                .order_by(EventModel.acknowledged_at)
+                .limit(limit)
+            )
+            out = []
+            for event in results.scalars():
+                out.append(await model_to_queued_event(event))
+            
             return out
 
     async def get_event(self, event_id: int) -> Optional[QueuedEvent]:
@@ -178,6 +210,18 @@ class EventBus:
             obj = await self._get_session(session)
             obj.ended_at = datetime.utcnow()
             obj.ended_by_event_id = source_event_id
+
+
+def event_bus_aiohttp_app(event_bus: EventBus) -> web.Application:
+    app = web.Application()
+
+    # TODO: add real implementation
+    async def event_bus_post(request: web.Request) -> web.Response:
+        return web.json_response({"ok": True})
+
+    app.add_routes([web.post("/", event_bus_post)])
+
+    return app
 
 
 class SessionEnded(Exception):
