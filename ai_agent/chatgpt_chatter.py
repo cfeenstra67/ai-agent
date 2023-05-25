@@ -10,9 +10,11 @@ class ChatGPTChatter(Chatter):
     """
     def __init__(
         self,
-        model: str = "gpt-3.5-turbo"
+        model: str = "gpt-3.5-turbo",
+        temperature: float = 1.0,
     ) -> None:
         self.model = model
+        self.temperature = temperature
 
     async def chat(self, messages: List[AgentMessage]) -> str:
         loop = asyncio.get_running_loop()

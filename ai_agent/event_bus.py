@@ -7,14 +7,17 @@ import sqlalchemy as sa
 from aiohttp import web
 from blinker import signal
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, AsyncSession
-from sqlalchemy.orm import joinedload, selectinload
+from sqlalchemy.orm import joinedload
 
 from ai_agent.models import EventModel, SessionModel
+from ai_agent.utils.blinker import iterate_signals
 
 
 DEFAULT_PRIORITY = 0
 
 event_queued = signal("event-queued")
+
+event_acked = signal("event-acked")
 
 
 async def create_session(name: str, engine: AsyncEngine) -> SessionModel:
@@ -140,7 +143,7 @@ class EventBus:
         destination: str,
         result: Optional[str] = None,
         error: Optional[str] = None,
-    ) -> None:
+    ) -> QueuedEvent:
         now = datetime.utcnow()
         async with self.Session() as session:
             await self._get_session(session)
@@ -159,6 +162,11 @@ class EventBus:
                 event.error = error
                 session.add(event)
                 await session.commit()
+
+                queued_event = await model_to_queued_event(event)
+                event_acked.send(self, event=queued_event)
+
+                return queued_event
 
     async def get_queued_events(self) -> List[QueuedEvent]:
         now = datetime.utcnow()
@@ -226,11 +234,16 @@ class EventBus:
 def event_bus_aiohttp_app(event_bus: EventBus) -> web.Application:
     app = web.Application()
 
-    # TODO: add real implementation
-    async def event_bus_post(request: web.Request) -> web.Response:
-        return web.json_response({"ok": True})
+    async def event_bus_tail(request: web.Request) -> web.Response:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        
+        async for _, kwargs in iterate_signals(event_acked, event_bus):
+            await ws.send_json(dc.asdict(kwargs["event"]))
 
-    app.add_routes([web.post("/", event_bus_post)])
+        return ws
+
+    app.add_routes([web.get("/tail", event_bus_tail)])
 
     return app
 

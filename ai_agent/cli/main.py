@@ -78,6 +78,7 @@ async def run(ctx, runner_path: str, socket: str, session_id: Optional[int], new
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    created = False
     if session_id is not None:
         session = await get_session(session_id, engine)
         click.secho(
@@ -92,6 +93,7 @@ async def run(ctx, runner_path: str, socket: str, session_id: Optional[int], new
             session_name,
             engine
         )
+        created = True
         click.secho(
             f"Session created. Name: {session_name}. "
             f"ID: {session.session_id}",
@@ -99,7 +101,7 @@ async def run(ctx, runner_path: str, socket: str, session_id: Optional[int], new
             bold=True
         )
 
-    runner, *coros = await maybe_await(handler(session.session_id, engine))
+    runner, *coros = await maybe_await(handler(session.session_id, engine, created))
 
     if not isinstance(runner, Runner):
         click.secho(f"Invalid response from handler in {runner_path}: {runner}")
@@ -162,4 +164,25 @@ async def attach(agent: str, socket: str):
                     break
                 elif message.type == aiohttp.WSMsgType.ERROR:
                     await aprint("ERROR", message)
+                    break
+
+
+@async_command(cli)
+@socket_option
+async def tail(socket: str):
+    connector = aiohttp.UnixConnector(path=socket)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        async with session.ws_connect(f"http://runner/event-bus/tail", timeout=0.5) as ws:
+            async for message in ws:
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(message.data)
+                    click.echo(f"{click.style('Type', fg='green', bold=True)}: {data['type']}")
+                    click.echo(f"{click.style('Destination', fg='green', bold=True)}: {data['destination']}")
+                    click.echo(f"{click.style('Result', fg='green', bold=True)}:\n{data['result']}")
+                    print()
+                elif message.type == aiohttp.WSMsgType.CLOSE:
+                    print("CLOSING", message)
+                    break
+                elif message.type == aiohttp.WSMsgType.ERROR:
+                    print("ERROR", message)
                     break

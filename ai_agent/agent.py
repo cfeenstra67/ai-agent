@@ -31,6 +31,7 @@ class Context:
         session_id: int,
         engine: AsyncEngine,
         event_bus: EventBus,
+        get_agents: Callable[[], List[str]],
         get_commands: Callable[[Optional[str]], List["Command"]],
         get_event_future: Callable[[int], asyncio.Future],
         event: Optional[QueuedEvent] = None,
@@ -40,6 +41,7 @@ class Context:
         self.event = event
         self.event_id = event and event.event_id
         self._event_bus = event_bus
+        self._get_agents = get_agents
         self._get_commands = get_commands
         self._get_event_future = get_event_future
         self.Session = async_sessionmaker(bind=engine)
@@ -92,6 +94,9 @@ class Context:
 
     def get_commands(self, agent: Optional[str] = None) -> List["Command"]:
         return self._get_commands(agent)
+
+    def get_agents(self) -> List[str]:
+        return self._get_agents()
 
     @contextlib.asynccontextmanager
     async def session_ctx(self):
@@ -284,11 +289,15 @@ class Runner:
             future = asyncio.Future()
             self._event_futures.setdefault(event_id, []).append(future)
             return future
+        
+        def get_agents():
+            return list(self.agents)
 
         return Context(
             self.session_id,
             self.engine,
             self.event_bus,
+            get_agents,
             self._get_commands,
             get_future,
             event=event
@@ -448,7 +457,6 @@ class Runner:
                 async for response in self._handle_agent_event(event):
                     result = response
                 self._handle_event_result(event, result)
-                print("HANDLE RESULT")
                 return
 
             if event.type == "command":
@@ -505,9 +513,9 @@ class Runner:
             if not tasks:
                 return True
 
-            done, _ = await asyncio.shield(asyncio.wait(
+            done, _ = await asyncio.wait(
                 list(tasks.values()), return_when=asyncio.FIRST_COMPLETED
-            ))
+            )
             for task in done:
                 event_id = reverse_tasks.pop(id(task))
                 tasks.pop(event_id, None)
@@ -548,9 +556,6 @@ class Runner:
                 else:
                     task_queue_empty.send(self)
 
-                if wait_task is not None:
-                    wait_task.cancel()
-
                 wait_task = asyncio.create_task(wait(events))
                 
                 if event_task is None:
@@ -562,7 +567,9 @@ class Runner:
                 if wait_task.done():
                     empty = wait_task.result()
                     wait_task = None
-                
+                else:
+                    wait_task.cancel()
+
                 if empty and not event_task.done():
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(asyncio.shield(event_task), 5)
