@@ -23,7 +23,7 @@ def validate_args(
         try:
             return parser.parse_args(args)
         except SystemExit:
-            raise ArgparseValidationError(out.getvalue())
+            raise ArgparseValidationError(out.getvalue().strip())
 
 
 def argparse_command(
@@ -44,14 +44,15 @@ def argparse_command(
             namespace = validate_args(parser, cmd.args)
             return f(namespace, cmd.body, ctx)
 
-        usage = capture_output(parser.print_usage)
-        description = capture_output(parser.print_help)
+        usage = capture_output(parser.print_usage).split(":", 1)[1].strip()
+        description = capture_output(parser.print_help).strip()
 
         return command(
             wrapper,
             name=parser.prog,
             usage=usage,
-            description=description,
+            description=parser.description,
+            long_description=description,
             validate=validate,
             **kwargs
         )

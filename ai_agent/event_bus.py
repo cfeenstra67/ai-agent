@@ -27,6 +27,17 @@ async def create_session(name: str, engine: AsyncEngine) -> SessionModel:
         return obj
 
 
+async def get_session(session_id: int, engine: AsyncEngine) -> SessionModel:
+    async with async_sessionmaker(bind=engine, expire_on_commit=False)() as session:
+        session = await session.scalar(
+            sa.select(SessionModel)
+            .where(SessionModel.session_id == session_id)
+        )
+        if session is None:
+            raise SessionNotFound(session_id)
+        return session
+
+
 @dc.dataclass(frozen=True)
 class Event:
     """ """

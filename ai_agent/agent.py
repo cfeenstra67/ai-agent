@@ -31,16 +31,16 @@ class Context:
         session_id: int,
         engine: AsyncEngine,
         event_bus: EventBus,
-        commands: List["Command"],
+        get_commands: Callable[[Optional[str]], List["Command"]],
         get_event_future: Callable[[int], asyncio.Future],
         event: Optional[QueuedEvent] = None,
     ) -> None:
         self.session_id = session_id
         self.engine = engine
-        self.commands = commands
         self.event = event
         self.event_id = event and event.event_id
         self._event_bus = event_bus
+        self._get_commands = get_commands
         self._get_event_future = get_event_future
         self.Session = async_sessionmaker(bind=engine)
 
@@ -90,6 +90,9 @@ class Context:
         future = self._get_event_future(event)
         return await future
 
+    def get_commands(self, agent: Optional[str] = None) -> List["Command"]:
+        return self._get_commands(agent)
+
     @contextlib.asynccontextmanager
     async def session_ctx(self):
         async with self.Session() as session:
@@ -111,6 +114,7 @@ class CommandDocumentation:
 
     usage: str
     description: str
+    long_description: str
 
 
 class Command(abc.ABC):
@@ -120,7 +124,7 @@ class Command(abc.ABC):
 
     def get_docs(self) -> CommandDocumentation:
         """ """
-        return CommandDocumentation(self.name, self.name)
+        return CommandDocumentation(self.name, self.name, self.name)
 
     def validate(self, args: List[str], body: Optional[str] = None) -> Optional[int]:
         """
@@ -140,6 +144,14 @@ class CommandParser(abc.ABC):
     def parse(self, result: str) -> Iterator[CommandRequest]:
         """ """
         raise NotImplementedError
+    
+
+@dc.dataclass(frozen=True)
+class AgentMessage:
+    """ """
+
+    message: str
+    actor: str = "user"
 
 
 class Agent(abc.ABC):
@@ -165,7 +177,19 @@ class Agent(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def chat(self, message: str, ctx: Context) -> str:
+    def filter_commands(self, commands: List[Command]) -> List[Command]:
+        """
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def get_messages(self, message: str, ctx: Context) -> List[AgentMessage]:
+        """
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def chat(self, messages: List[AgentMessage], ctx: Context) -> str:
         """ """
         raise NotImplementedError
 
@@ -265,10 +289,19 @@ class Runner:
             self.session_id,
             self.engine,
             self.event_bus,
-            list(self.commands.values()),
+            self._get_commands,
             get_future,
             event=event
         )
+
+    def _get_commands(self, agent: Optional[str]) -> List[Command]:
+        all_commands = list(self.commands.values())
+        if agent is None:
+            return all_commands
+        if agent not in self.agents:
+            raise InvalidAgent(agent)
+        agent_obj = self.agents[agent]
+        return agent_obj.filter_commands(all_commands)
 
     def _handle_event_result(self, event: QueuedEvent, result: str) -> None:
         for future in self._event_futures.pop(event.event_id, []):
@@ -289,20 +322,27 @@ class Runner:
         for middleware in self.agent_middlewares:
             agent = await maybe_await(middleware(agent, ctx))
 
-        response = await agent.chat(event.payload["message"], ctx)
+        messages = await agent.get_messages(event.payload["message"], ctx)
+        response = await agent.chat(messages, ctx)
+        yield response
 
         try:
             commands = list(self.command_parser.parse(response))
         except Exception as err:
             raise AgentResponseValidationError(response, "parsing", [err])
 
+        agent_commands = {
+            cmd.name: cmd
+            for cmd in self._get_commands(agent_name)
+        }
+
         errors = []
         priorities = []
         for command in commands:
             try:
-                if command.command not in self.commands:
+                if command.command not in agent_commands:
                     raise InvalidCommand(command.command)
-                priority = self.commands[command.command].validate(command.args, command.body)
+                priority = agent_commands[command.command].validate(command.args, command.body)
                 if priority is None:
                     priority = DEFAULT_PRIORITY
                 priorities.append(priority)
@@ -314,8 +354,6 @@ class Runner:
 
         for command, priority in zip(commands, priorities):
             await ctx.queue_command(command.command, command.args, command.body, priority=priority)
-
-        return response
 
     async def _handle_command_event(self, event: QueuedEvent) -> Optional[str]:
         command_name = event.destination
@@ -333,6 +371,7 @@ class Runner:
             ),
             ctx,
         )
+        yield response
 
         if event.source_type == "agent" and response is not None:
             agent_name = event.source_destination
@@ -343,8 +382,6 @@ class Runner:
             await ctx.queue_agent(
                 event.source_destination, await agent.format_command_result(event, response)
             )
-
-        return response
 
     async def _handle_agent_error(
         self, event: QueuedEvent, error: Exception, stack: str
@@ -405,14 +442,18 @@ class Runner:
 
         result = None
         stack = None
+        cancelled = False
         try:
             if event.type == "agent":
-                result = await self._handle_agent_event(event)
+                async for response in self._handle_agent_event(event):
+                    result = response
                 self._handle_event_result(event, result)
+                print("HANDLE RESULT")
                 return
 
             if event.type == "command":
-                result = await self._handle_command_event(event)
+                async for response in self._handle_command_event(event):
+                    result = response
                 self._handle_event_result(event, result)
                 return
 
@@ -422,6 +463,9 @@ class Runner:
                 event.destination,
                 event.event_id,
             )
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except Exception as err:
             stack = traceback.format_exc()
             LOGGER.exception(
@@ -433,13 +477,14 @@ class Runner:
             await self._handle_error(event, err, stack)
             self._handle_event_error(event, err)
         finally:
-            await self.event_bus.ack_event(
-                event.event_id,
-                event.type,
-                event.destination,
-                result=result,
-                error=stack,
-            )
+            if not cancelled:
+                await self.event_bus.ack_event(
+                    event.event_id,
+                    event.type,
+                    event.destination,
+                    result=result,
+                    error=stack,
+                )
 
     @contextlib.contextmanager
     def _task_waiter(self):
@@ -571,12 +616,3 @@ class InvalidCommand(AIAgentError):
     def __init__(self, name: str) -> None:
         self.name = name
         super().__init__(f"Invalid command: {name}")
-
-
-class CommandValidationError(AIAgentError):
-    """ """
-
-    def __init__(self, command: str, message: str) -> None:
-        self.command = command
-        self.message = message
-        super().__init__(f"Command {command} raised validation error: {message}")

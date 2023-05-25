@@ -22,7 +22,7 @@ class DefaultCommandParser(CommandParser, MessageProvider):
     EOF
     """).strip()
 
-    async def get_messages(self, ctx: Context) -> List[AgentMessage]:
+    async def get_messages(self, agent: str, ctx: Context) -> List[AgentMessage]:
         return [AgentMessage(self.docs)]
 
     def parse(self, result: str) -> Iterator[CommandRequest]:

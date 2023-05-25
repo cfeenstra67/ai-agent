@@ -6,7 +6,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from ai_agent.agent import Command
+from ai_agent.agent import AgentMessage, Command, Context
 from ai_agent.api import message_provider
 from ai_agent.argparse_command import argparse_command
 from ai_agent.modular_agent import MessageProvider, AgentMessage
@@ -34,7 +34,8 @@ class WorkingMemoryItem(Base):
 def working_memory_add_parser(name: str):
     parser = argparse.ArgumentParser(
         prog=name,
-        description="Add an item to working memory"
+        description="Add an item to working memory",
+        add_help=False,
     )
     parser.add_argument(
         "item",
@@ -47,7 +48,8 @@ def working_memory_add_parser(name: str):
 def working_memory_rm_parser(name: str):
     parser = argparse.ArgumentParser(
         prog=name,
-        description="Remove an item from working memory"
+        description="Remove an item from working memory",
+        add_help=False,
     )
     parser.add_argument(
         "item_id",
@@ -61,7 +63,8 @@ def working_memory_rm_parser(name: str):
 def working_memory_replace_parser(name: str):
     parser = argparse.ArgumentParser(
         prog=name,
-        description="Replace an existing item with a new one"
+        description="Replace an existing item with a new one",
+        add_help=False
     )
     parser.add_argument(
         "item_id",
@@ -75,7 +78,7 @@ def working_memory_replace_parser(name: str):
     return parser
 
 
-class WorkingMemoryService:
+class WorkingMemoryService(MessageProvider):
     """
     """
     def __init__(self, prefix: str = "workmem-", command_priority: int = 9) -> None:
@@ -85,28 +88,23 @@ class WorkingMemoryService:
     def get_sqlalchemy_metadata(self) -> sa.MetaData:
         return Base.metadata
 
-    def message_provider(self, agent: str) -> MessageProvider:
-    
-        @message_provider
-        async def working_memory_message(ctx):
-            async with ctx.session_ctx() as session:
-                result = await session.execute(
-                    sa.select(WorkingMemoryItem)
-                    .where(WorkingMemoryItem.deleted_at == None)
-                    .where(WorkingMemoryItem.session_id == ctx.session_id)
-                    .where(WorkingMemoryItem.agent == agent)
-                )
+    async def get_messages(self, agent: str, ctx: Context) -> List[AgentMessage]:
+        async with ctx.session_ctx() as session:
+            result = await session.execute(
+                sa.select(WorkingMemoryItem)
+                .where(WorkingMemoryItem.deleted_at == None)
+                .where(WorkingMemoryItem.session_id == ctx.session_id)
+                .where(WorkingMemoryItem.agent == agent)
+            )
 
-                lines = ["Working memory items:"]
-                for item in result.scalars():
-                    lines.append(f"{item.item_id}: {item.value}")
-                
-                if len(lines) == 1:
-                    lines.append("Items will appear here when you add them")
+            lines = ["Working memory items:"]
+            for item in result.scalars():
+                lines.append(f"{item.item_id}: {item.value}")
+            
+            if len(lines) == 1:
+                lines.append("Items will appear here when you add them")
 
-                return [AgentMessage("\n\n".join(lines))]
-
-        return working_memory_message
+            return [AgentMessage("\n\n".join(lines))]
 
     def commands(self) -> List[Command]:
 

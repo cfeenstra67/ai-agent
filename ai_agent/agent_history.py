@@ -1,15 +1,14 @@
-import copy
 import logging
 from datetime import datetime
-from functools import wraps
-from typing import Optional
+from typing import Optional, List
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from ai_agent.agent import Agent, Context
-from ai_agent.modular_agent import ModularAgent, MessageProvider, MessageFactory, AgentMessage
+from ai_agent.agent import Agent, AgentMessage, Context
+from ai_agent.api import AgentWrapper, message_provider
+from ai_agent.modular_agent import MessageProvider, AgentMessage
 
 
 LOGGER = logging.getLogger(__name__)
@@ -33,47 +32,33 @@ class AgentHistoryItem(Base):
     created_at: Mapped[datetime]
 
 
-class AgentHistoryService:
+class AgentHistoryService(MessageProvider):
     """
     """
+    def __init__(self, num_history_messages: int = 5) -> None:
+        self.num_history_messages = num_history_messages
+
     def get_sqlalchemy_metadata(self) -> sa.MetaData:
         return Base.metadata
 
-    def message_provider(
-        self,
-        agent: str,
-        num_messages: int = 5,
-    ) -> MessageProvider:
-        
-        class HistoryMessageProvider(MessageProvider):
+    async def get_messages(self, agent: str, ctx: Context) -> List[AgentMessage]:
+        history = await ctx.get_event_history(
+            type="agent",
+            destination=agent,
+            limit=self.num_history_messages,
+        )
+        out = []
+        for item in history:
+            out.append(AgentMessage(item.payload["message"]))
+            if item.result is not None:
+                out.append(AgentMessage(item.result, "assistant"))
 
-            async def get_messages(self, ctx: Context):
-                history = await ctx.get_event_history(
-                    type="agent",
-                    destination=agent,
-                    limit=num_messages,
-                )
-                out = []
-                for item in history:
-                    out.append(AgentMessage(item.payload["message"]))
-                    if item.result is not None:
-                        out.append(AgentMessage(item.result, "assistant"))
+        return out[-self.num_history_messages:]
 
-                return out[-num_messages:]
+    def __call__(self, agent: Agent, ctx: Context) -> Agent:
 
-        return HistoryMessageProvider()
-
-    def middleware(self, agent: Agent, ctx: Context) -> Agent:
-        if not isinstance(agent, ModularAgent):
-            LOGGER.warn("History only implemented for ModularAgents")
-            return agent
-
-        agent_copy = copy.copy(agent)
-
-        @wraps(agent_copy.chat)
-        async def chat(message: str, ctx: Context):
-            messages = await agent.get_messages(message, ctx)
-            result = await agent.chatter.chat(messages)
+        async def chat(messages: List[AgentMessage], ctx: Context):
+            result = await agent.chat(messages, ctx)
             now = datetime.utcnow()
             async with ctx.session_ctx() as session:
                 idx = 0
@@ -104,6 +89,4 @@ class AgentHistoryService:
 
             return result
 
-        agent_copy.chat = chat
-
-        return agent_copy
+        return AgentWrapper(agent, new_chat=chat)

@@ -22,7 +22,7 @@ def wait_for_signal(signal: blinker.Signal, sender: Any = blinker.ANY) -> asynci
     return future
 
 
-async def iterate_signals(signal: blinker.Signal, sender: Any = blinker.ANY) -> AsyncGenerator:
+async def iterate_signals(signal: blinker.Signal, sender: Any = blinker.ANY) -> AsyncGenerator:    
     queue = asyncio.Queue()
 
     def handle_signal(sender, **kwargs):
